@@ -5119,7 +5119,16 @@ class MemoryEngine(MemoryEngineInterface):
 
                     # Ensure reranker is initialized (for lazy initialization mode)
                     await reranker_instance.ensure_initialized()
-                    scored_results = await reranker_instance.rerank(query, merged_candidates)
+                    # Foreground vs background priority for the reranker pool.
+                    # Internal/background operations — consolidation and reflect
+                    # sub-recalls (RequestContext.internal=True) — fan out a wall of
+                    # reranks; marking them background lets a local reranker keep
+                    # interactive (foreground) recall reranks from being starved
+                    # behind that queue.
+                    background_rerank = bool(request_context is not None and request_context.internal)
+                    scored_results = await reranker_instance.rerank(
+                        query, merged_candidates, background=background_rerank
+                    )
                 else:
                     # "rrf" / "interleave": skip the cross-encoder and keep the fusion order
                     # (rrf_score is descending by fusion position for both). The cross-encoder

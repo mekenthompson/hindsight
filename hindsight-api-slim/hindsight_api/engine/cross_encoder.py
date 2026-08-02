@@ -7,11 +7,14 @@ Configuration via environment variables - see hindsight_api.config for all env v
 """
 
 import asyncio
+import itertools
 import logging
 import os
+import queue
+import threading
 import warnings
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -57,6 +60,94 @@ from .tei_retry import tei_retry_delay
 logger = logging.getLogger(__name__)
 
 
+class _PriorityRerankExecutor:
+    """Fixed-size thread pool that dispatches foreground work ahead of queued background work.
+
+    Reranking is CPU-bound and runs in worker threads. A plain
+    ``ThreadPoolExecutor`` drains a single FIFO queue, so an interactive
+    (foreground) rerank submitted while a large fan-out of background reranks is
+    already queued must wait behind every one of them. Consolidation/reflect
+    issue exactly that background fan-out (each internal sub-recall runs a
+    rerank), which spikes foreground recall latency.
+
+    This pool keeps foreground reranks responsive by ordering the shared work
+    queue foreground-first. A foreground job jumps ahead of any *queued*
+    background jobs, but it does not preempt a background job already running in
+    a worker — so background always keeps making progress between foreground
+    arrivals. This is foreground *priority*, not background exclusion.
+
+    Note on starvation: a sustained, saturating stream of foreground jobs could
+    in principle keep background jobs queued indefinitely. In this system that
+    cannot happen in practice — foreground reranks are driven by per-user recall
+    turns (bounded, bursty), while background reranks are the bulk fan-out.
+    Foreground volume cannot saturate the pool, so background continues to drain.
+    """
+
+    # Lower number == higher priority in the PriorityQueue.
+    _FOREGROUND = 0
+    _BACKGROUND = 1
+    _SHUTDOWN_PRIORITY = -1
+
+    _SHUTDOWN = object()
+
+    def __init__(self, max_workers: int, thread_name_prefix: str = "reranker"):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        self._max_workers = max_workers
+        # Items are (priority, seq, fn, args, future). ``seq`` is a strictly
+        # increasing tie-breaker so the payload (fn/future) is never compared —
+        # PriorityQueue only ever orders by (priority, seq), both integers.
+        self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._seq = itertools.count()
+        self._seq_lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        for i in range(max_workers):
+            t = threading.Thread(
+                target=self._worker,
+                name=f"{thread_name_prefix}-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+    def _next_seq(self) -> int:
+        # itertools.count() is not documented thread-safe under free-threading;
+        # guard it so ties never collide (a collision would compare payloads).
+        with self._seq_lock:
+            return next(self._seq)
+
+    def submit(self, fn, /, *args, background: bool = False) -> Future:
+        """Schedule ``fn(*args)``; foreground jobs jump ahead of queued background jobs."""
+        fut: Future = Future()
+        priority = self._BACKGROUND if background else self._FOREGROUND
+        self._queue.put((priority, self._next_seq(), fn, args, fut))
+        return fut
+
+    def _worker(self) -> None:
+        while True:
+            _priority, _seq, fn, args, fut = self._queue.get()
+            try:
+                if fn is self._SHUTDOWN:
+                    return
+                if not fut.set_running_or_notify_cancel():
+                    # Caller cancelled before we started — skip.
+                    continue
+                try:
+                    fut.set_result(fn(*args))
+                except BaseException as exc:  # noqa: BLE001 — propagate to the awaiting caller
+                    fut.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Stop all workers. Sentinels preempt queued work so shutdown is prompt."""
+        for _ in self._threads:
+            self._queue.put((self._SHUTDOWN_PRIORITY, self._next_seq(), self._SHUTDOWN, (), Future()))
+        if wait:
+            for t in self._threads:
+                t.join()
+
+
 class CrossEncoderModel(ABC):
     """
     Abstract base class for cross-encoder reranking.
@@ -81,12 +172,17 @@ class CrossEncoderModel(ABC):
         pass
 
     @abstractmethod
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs for relevance.
 
         Args:
             pairs: List of (query, document) tuples to score
+            background: True for internal/background reranks (e.g. consolidation
+                and reflect sub-recalls). Providers with a local worker pool use
+                this to give interactive (foreground) reranks queue priority so
+                they are not starved behind a background fan-out. Remote providers
+                have their own concurrency controls and may ignore it.
 
         Returns:
             List of relevance scores (higher = more relevant)
@@ -108,8 +204,12 @@ class LocalSTCrossEncoder(CrossEncoderModel):
     Uses a dedicated thread pool to limit concurrent CPU-bound work.
     """
 
-    # Shared executor across all instances (one model loaded anyway)
-    _executor: ThreadPoolExecutor | None = None
+    # Shared executor across all instances (one model loaded anyway).
+    # Priority-aware: foreground reranks are dispatched ahead of queued
+    # background ones so interactive recall latency is not starved by the
+    # consolidation/reflect background fan-out.
+    _executor: "_PriorityRerankExecutor | None" = None
+    _executor_lock: threading.Lock = threading.Lock()
     _max_concurrent: int = 4  # Limit concurrent CPU-bound reranking calls
 
     def __init__(
@@ -235,15 +335,34 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             self._model.model.half()
             logger.info("Reranker: FP16 inference enabled")
 
-        # Initialize shared executor (limited workers naturally limits concurrency)
-        if LocalSTCrossEncoder._executor is None:
-            LocalSTCrossEncoder._executor = ThreadPoolExecutor(
-                max_workers=LocalSTCrossEncoder._max_concurrent,
-                thread_name_prefix="reranker",
-            )
+        # Initialize the shared priority-aware executor (limited workers naturally
+        # limits concurrency; foreground reranks jump ahead of queued background ones).
+        created = LocalSTCrossEncoder._executor is None
+        LocalSTCrossEncoder._get_executor()
+        if created:
             logger.info(f"Reranker: local provider initialized (max_concurrent={LocalSTCrossEncoder._max_concurrent})")
         else:
             logger.info("Reranker: local provider initialized (using existing executor)")
+
+    @classmethod
+    def _get_executor(cls) -> "_PriorityRerankExecutor":
+        """Return the shared priority executor, creating it on first use.
+
+        Lazy creation keeps predict() usable when a caller skips initialize()
+        (the model is injected directly), mirroring the previous
+        ``run_in_executor(None, ...)`` fallback while now routing through the
+        foreground-priority pool.
+        """
+        ex = cls._executor
+        if ex is None:
+            with cls._executor_lock:
+                if cls._executor is None:
+                    cls._executor = _PriorityRerankExecutor(
+                        max_workers=cls._max_concurrent,
+                        thread_name_prefix="reranker",
+                    )
+                ex = cls._executor
+        return ex
 
     def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Synchronous prediction wrapper for thread pool execution.
@@ -276,14 +395,18 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         finally:
             release_local_inference_memory(self._device_type)
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs for relevance.
 
-        Uses a dedicated thread pool with limited workers to prevent CPU thrashing.
+        Uses a dedicated priority-aware thread pool with limited workers to
+        prevent CPU thrashing. Foreground reranks (``background=False``) are
+        dispatched ahead of queued background reranks so interactive recall is
+        not starved behind a consolidation/reflect background fan-out.
 
         Args:
             pairs: List of (query, document) tuples to score
+            background: True for internal/background reranks (lower queue priority)
 
         Returns:
             List of relevance scores (raw logits from the model)
@@ -291,13 +414,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         if self._model is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
-        # Use dedicated executor - limited workers naturally limits concurrency
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            LocalSTCrossEncoder._executor,
-            self._predict_sync,
-            pairs,
-        )
+        # Priority-aware executor: limited workers limit concurrency, and
+        # foreground work jumps ahead of queued background work.
+        fut = LocalSTCrossEncoder._get_executor().submit(self._predict_sync, pairs, background=background)
+        return await asyncio.wrap_future(fut)
 
 
 class RemoteTEICrossEncoder(CrossEncoderModel):
@@ -504,7 +624,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
 
         return all_scores
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using the remote TEI reranker.
 
@@ -564,7 +684,7 @@ class _CohereCompatibleRerankClient:
             },
         )
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         if self._async_client is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
@@ -674,7 +794,7 @@ class CohereCrossEncoder(CrossEncoderModel):
             self._client = cohere.Client(api_key=self.api_key, timeout=self.timeout)
             logger.info("Reranker: Cohere provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using the Cohere Rerank API.
 
@@ -762,7 +882,7 @@ class ZeroEntropyCrossEncoder(CrossEncoderModel):
         await self._client.initialize()
         logger.info("Reranker: ZeroEntropy provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         return await self._client.predict(pairs)
 
 
@@ -804,7 +924,7 @@ class SiliconFlowCrossEncoder(CrossEncoderModel):
         await self._client.initialize()
         logger.info("Reranker: SiliconFlow provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         return await self._client.predict(pairs)
 
 
@@ -830,7 +950,7 @@ class RRFPassthroughCrossEncoder(CrossEncoderModel):
         """No initialization needed."""
         logger.info("Reranker: RRF passthrough provider initialized (neural reranking disabled)")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Return neutral scores - actual ranking uses RRF scores from retrieval.
 
@@ -996,7 +1116,7 @@ class FlashRankCrossEncoder(CrossEncoderModel):
         finally:
             release_local_inference_memory(self._device_type)
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using FlashRank.
 
@@ -1088,7 +1208,7 @@ class LiteLLMCrossEncoder(CrossEncoderModel):
         self._async_client = httpx.AsyncClient(timeout=self.timeout, headers=headers)
         logger.info("Reranker: LiteLLM provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using the LiteLLM proxy's /rerank endpoint.
 
@@ -1208,7 +1328,7 @@ class LiteLLMSDKCrossEncoder(CrossEncoderModel):
         self._initialized = True
         logger.info("Reranker: LiteLLM SDK provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using the LiteLLM SDK.
 
@@ -1367,7 +1487,7 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
 
         return all_scores
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         if self._reranker is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
@@ -1513,7 +1633,7 @@ class GoogleCrossEncoder(CrossEncoderModel):
 
         return all_scores
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         """
         Score query-document pairs using Google Discovery Engine Ranking API.
 
@@ -1571,7 +1691,7 @@ class AlibabaCloudCrossEncoder(CrossEncoderModel):
         await self._client.initialize()
         logger.info("Reranker: Alibaba Cloud provider initialized")
 
-    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:
         return await self._client.predict(pairs)
 
 

@@ -247,13 +247,18 @@ class CrossEncoderReranker:
             ) from e
         self._initialized = True
 
-    async def rerank(self, query: str, candidates: list[MergedCandidate]) -> list[ScoredResult]:
+    async def rerank(
+        self, query: str, candidates: list[MergedCandidate], *, background: bool = False
+    ) -> list[ScoredResult]:
         """
         Rerank candidates using cross-encoder scores.
 
         Args:
             query: Search query
             candidates: Merged candidates from RRF
+            background: True for internal/background recalls (consolidation, reflect
+                sub-recalls). Forwarded to the cross-encoder so a local reranker can
+                give foreground (interactive) reranks queue priority.
 
         Returns:
             List of ScoredResult objects sorted by cross-encoder score
@@ -288,7 +293,7 @@ class CrossEncoderReranker:
             pairs.append([query, doc_text])
 
         # Get cross-encoder scores
-        scores = await self.cross_encoder.predict(pairs)
+        scores = await self.cross_encoder.predict(pairs, background=background)
 
         # Normalize scores to [0, 1] range.
         # External API rerankers (Cohere, Jina, llama.cpp/Qwen, etc.) return
