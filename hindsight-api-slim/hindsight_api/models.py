@@ -191,7 +191,9 @@ class Entity(Base):
 
     # Relationships
     unit_entities = relationship("UnitEntity", back_populates="entity", cascade="all, delete-orphan")
-    memory_links = relationship("MemoryLink", back_populates="entity", cascade="all, delete-orphan")
+    # No ``memory_links`` relationship: entity edges are no longer materialised
+    # in ``memory_links`` (see ``MemoryLink.entity_id``), and the FK backing the
+    # relationship was dropped by migration ``c4f7a2e9b6d1``.
     cooccurrences_1 = relationship(
         "EntityCooccurrence",
         foreign_keys="EntityCooccurrence.entity_id_1",
@@ -272,16 +274,22 @@ class MemoryLink(Base):
         UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), primary_key=True
     )
     link_type: Mapped[str] = mapped_column(Text, primary_key=True)
-    entity_id: Mapped[PyUUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), primary_key=True
-    )
+    # Vestigial. Entity edges are derived from ``unit_entities`` on demand
+    # (``e9b2c7d1f3a4`` deleted the last ``link_type = 'entity'`` row), so this
+    # column is NULL in every row. It is kept only because it is a key column of
+    # the ``idx_memory_links_unique`` COALESCE index that arbitrates retain's
+    # ``ON CONFLICT``. It carries NO ForeignKey: the ``ON DELETE CASCADE`` FK to
+    # ``entities`` was dropped by migration ``c4f7a2e9b6d1`` — with no index
+    # leading on ``entity_id``, its RI trigger seq-scanned all of
+    # ``memory_links`` per deleted entity (1.278 s/row), which made
+    # ``prune_orphan_entities`` time out permanently.
+    entity_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True), primary_key=True)
     weight: Mapped[float] = mapped_column(Float, nullable=False, server_default="1.0")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
     # Relationships
     from_unit = relationship("MemoryUnit", foreign_keys=[from_unit_id], back_populates="outgoing_links")
     to_unit = relationship("MemoryUnit", foreign_keys=[to_unit_id], back_populates="incoming_links")
-    entity = relationship("Entity", back_populates="memory_links")
 
     __table_args__ = (
         # Retain writes ``caused_by`` only. Keep the historical causal values

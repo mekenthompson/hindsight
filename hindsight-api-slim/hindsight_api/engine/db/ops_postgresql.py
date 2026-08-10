@@ -446,9 +446,21 @@ class PostgreSQLOps(DataAccessOps):
         bank_id: str,
     ) -> int:
         # Scoped by entities.bank_id (indexed). The NOT EXISTS subquery is
-        # backed by idx_ue_entity on unit_entities(entity_id), so this stays
-        # linear in the number of entities in the bank — not in the size of
-        # unit_entities globally.
+        # backed by idx_unit_entities_entity_unit on unit_entities
+        # (entity_id, unit_id) — the standalone idx_ue_entity this comment used
+        # to name is not a PG index at all: it was dropped by h3i4j5k6l7m8 /
+        # e1b2c3d4f5a6 and the name now survives only in the Oracle baseline.
+        # So the anti-join stays linear in the number of entities in the bank —
+        # not in the size of unit_entities globally.
+        #
+        # The anti-join is not what makes this statement expensive; the DELETE's
+        # cascade children are. Every ON DELETE CASCADE child of `entities` must
+        # have an index leading on its FK column, or its RI trigger degrades to
+        # a per-parent-row seq scan of the child table. `memory_links` had no
+        # such index and cost 1.278 s per orphan pruned — enough to blow the
+        # 60 s asyncpg command_timeout on any real backlog — until migration
+        # c4f7a2e9b6d1 dropped that (vestigial) FK. Keep the invariant in mind
+        # before adding a new cascade child.
         result = await conn.execute(
             f"""
             DELETE FROM {entities_table} e
